@@ -164,7 +164,23 @@ async function sortByYear(guild, preview) {
     try { await c.setParent(cat, { lockPermissions: false }); moved++; }
     catch (err) { log.push(`#${c.name} ❌ ${err.message}`); }
   }
-  return [preview ? `would move ${log.length} channels` : `moved ${moved} channels`, ...log];
+  const head = preview ? `would move ${log.length} channels` : `moved ${moved} channels`;
+
+  // Non-year categories keep their order on top; year categories follow, newest first.
+  const cs = [...guild.channels.cache.filter(c => c.type === ChannelType.GuildCategory).values()]
+    .sort((a, b) => a.rawPosition - b.rawPosition);
+  const yr = c => Number(plain(c.name).match(YEAR)?.[1]);
+  const order = [...cs.filter(c => !yr(c)), ...cs.filter(yr).sort((a, b) => yr(b) - yr(a))];
+  if (order.some((c, i) => c !== cs[i])) {
+    if (preview) log.push(`categories → ${order.map(c => c.name).join(' › ')}`);
+    else {
+      try {
+        await guild.channels.setPositions(order.map((c, i) => ({ channel: c.id, position: cs[i].rawPosition })));
+        log.push('categories reordered ✅');
+      } catch (err) { log.push(`category order ❌ ${err.message}`); }
+    }
+  }
+  return [head, ...log];
 }
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
