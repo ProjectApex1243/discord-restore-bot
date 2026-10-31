@@ -22,7 +22,7 @@ const cleanupCmd = new SlashCommandBuilder()
 
 const sortCmd = new SlashCommandBuilder()
   .setName('sort')
-  .setDescription('Move channels with a year in the name (23, 24, 2025...) into the matching year category')
+  .setDescription('File channels into year categories and sections (logs, community...), then order categories')
   .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
   .addBooleanOption(o => o.setName('preview').setDescription('List the moves, change nothing'));
 
@@ -147,6 +147,21 @@ async function cleanupBy(guild, userId, names, since, confirm) {
 // "spring-26" / "halloween-2024" -> category whose name has 26 / 2024 (years 2020-2029 only).
 const YEAR = /(?<!\d)(?:20)?(2\d)(?!\d)/;
 
+// Loose channels only. category-name word -> channel-name words (first match wins). Edit to taste.
+const SECTIONS = {
+  logs: ['logs'],
+  important: ['rules', 'announcement', 'welcome', 'partner'],
+  community: ['chat', 'media', 'show-off', 'hangout', 'booster', 'leaks', 'house'],
+  'project making': ['script', 'asset', 'package', 'tutorial', 'playfab', 'photon', 'steam-db', 'dlc', 'revision', 'project', 'audio'],
+};
+
+function sectionFor(guild, c) {
+  const n = plain(c.name);
+  const key = c.type === ChannelType.GuildVoice || c.type === ChannelType.GuildStageVoice
+    ? 'vc' : Object.keys(SECTIONS).find(k => SECTIONS[k].some(w => n.includes(w)));
+  return key && guild.channels.cache.find(x => x.type === ChannelType.GuildCategory && plain(x.name).includes(key));
+}
+
 async function sortByYear(guild, preview) {
   await guild.channels.fetch();
   const cats = new Map(); // "26" -> category
@@ -158,7 +173,7 @@ async function sortByYear(guild, preview) {
   let moved = 0;
   for (const c of guild.channels.cache.values()) {
     if (c.type === ChannelType.GuildCategory || c.isThread()) continue;
-    const cat = cats.get(plain(c.name).match(YEAR)?.[1]);
+    const cat = cats.get(plain(c.name).match(YEAR)?.[1]) ?? (c.parentId ? null : sectionFor(guild, c));
     if (!cat || c.parentId === cat.id) continue;
     if (preview) { log.push(`#${c.name} → ${cat.name}`); continue; }
     try { await c.setParent(cat, { lockPermissions: false }); moved++; }
