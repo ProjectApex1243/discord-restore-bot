@@ -20,6 +20,12 @@ const cleanupCmd = new SlashCommandBuilder()
   .addIntegerOption(o => o.setName('hours').setDescription('How far back to look (default 24)').setMinValue(1).setMaxValue(1080))
   .addBooleanOption(o => o.setName('confirm').setDescription('Actually delete. Without this it only counts'));
 
+const sortCmd = new SlashCommandBuilder()
+  .setName('sort')
+  .setDescription('Move channels with a year in the name (23, 24, 2025...) into the matching year category')
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+  .addBooleanOption(o => o.setName('preview').setDescription('List the moves, change nothing'));
+
 const CHANNEL_TYPES = new Set([
   ChannelType.GuildText, ChannelType.GuildVoice, ChannelType.GuildCategory,
   ChannelType.GuildAnnouncement, ChannelType.GuildStageVoice, ChannelType.GuildForum,
@@ -138,14 +144,37 @@ async function cleanupBy(guild, userId, names, since, confirm) {
   return [`deleted ${victims.size - fails.length} channels/roles`, ...fails];
 }
 
+// "spring-26" / "halloween-2024" -> category whose name has 26 / 2024 (years 2020-2029 only).
+const YEAR = /(?<!\d)(?:20)?(2\d)(?!\d)/;
+
+async function sortByYear(guild, preview) {
+  await guild.channels.fetch();
+  const cats = new Map(); // "26" -> category
+  for (const c of guild.channels.cache.values()) {
+    const y = c.type === ChannelType.GuildCategory && plain(c.name).match(YEAR)?.[1];
+    if (y && !cats.has(y)) cats.set(y, c);
+  }
+  const log = [];
+  let moved = 0;
+  for (const c of guild.channels.cache.values()) {
+    if (c.type === ChannelType.GuildCategory || c.isThread()) continue;
+    const cat = cats.get(plain(c.name).match(YEAR)?.[1]);
+    if (!cat || c.parentId === cat.id) continue;
+    if (preview) { log.push(`#${c.name} → ${cat.name}`); continue; }
+    try { await c.setParent(cat, { lockPermissions: false }); moved++; }
+    catch (err) { log.push(`#${c.name} ❌ ${err.message}`); }
+  }
+  return [preview ? `would move ${log.length} channels` : `moved ${moved} channels`, ...log];
+}
+
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-const register = g => g.commands.set([command.toJSON(), cleanupCmd.toJSON()]).catch(console.error);
+const register = g => g.commands.set([command, cleanupCmd, sortCmd].map(c => c.toJSON())).catch(console.error);
 
 client.once(Events.ClientReady, c => { console.log(`up as ${c.user.tag}`); c.guilds.cache.forEach(register); });
 client.on(Events.GuildCreate, register);
 
 client.on(Events.InteractionCreate, async i => {
-  if (!i.isChatInputCommand() || !['restore', 'cleanup'].includes(i.commandName) || !i.guild) return;
+  if (!i.isChatInputCommand() || !['restore', 'cleanup', 'sort'].includes(i.commandName) || !i.guild) return;
   if (!i.memberPermissions.has(PermissionFlagsBits.Administrator)) return i.reply({ content: 'Admins only.', ephemeral: true });
   const user = i.options.getUser('user');
   if (user && (user.id === client.user.id || user.id === i.guild.ownerId)) {
@@ -158,9 +187,12 @@ client.on(Events.InteractionCreate, async i => {
   await i.deferReply({ ephemeral: true });
   const since = Date.now() - (i.options.getInteger('hours') ?? 24) * 3600e3;
   try {
+    const preview = i.options.getBoolean('preview') ?? false;
     const log = i.commandName === 'cleanup'
       ? await cleanupBy(i.guild, user?.id, names, since, i.options.getBoolean('confirm') ?? false)
-      : await restore(i.guild, since, i.options.getBoolean('preview') ?? false);
+      : i.commandName === 'sort'
+        ? await sortByYear(i.guild, preview)
+        : await restore(i.guild, since, preview);
     await i.editReply(log.join('\n').slice(0, 1900));
   } catch (err) { await i.editReply(`failed: ${err.message}`); }
 });
