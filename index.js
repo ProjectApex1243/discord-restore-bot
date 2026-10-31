@@ -11,6 +11,14 @@ const command = new SlashCommandBuilder()
   .addIntegerOption(o => o.setName('hours').setDescription('How far back to look (default 24)').setMinValue(1).setMaxValue(1080))
   .addBooleanOption(o => o.setName('preview').setDescription('List what would be restored, change nothing'));
 
+const cleanupCmd = new SlashCommandBuilder()
+  .setName('cleanup')
+  .setDescription('Delete channels and roles a raider created')
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+  .addUserOption(o => o.setName('user').setDescription('The raider (user or bot)').setRequired(true))
+  .addIntegerOption(o => o.setName('hours').setDescription('How far back to look (default 24)').setMinValue(1).setMaxValue(1080))
+  .addBooleanOption(o => o.setName('confirm').setDescription('Actually delete. Without this it only counts'));
+
 const CHANNEL_TYPES = new Set([
   ChannelType.GuildText, ChannelType.GuildVoice, ChannelType.GuildCategory,
   ChannelType.GuildAnnouncement, ChannelType.GuildStageVoice, ChannelType.GuildForum,
@@ -39,6 +47,17 @@ async function restore(guild, since, preview) {
   await guild.channels.fetch();
   const roleMap = new Map(); // deleted id -> live id
   const chanMap = new Map();
+
+  // Oldest rename in the window holds the pre-raid name.
+  const rename = (await fetchAll(guild, AuditLogEvent.GuildUpdate, since))
+    .map(e => e.changes.find(c => c.key === 'name')).find(Boolean);
+  if (rename && rename.old !== guild.name) {
+    if (preview) log.push(`would rename server to **${rename.old}**`);
+    else {
+      try { await guild.setName(rename.old); log.push(`server name → **${rename.old}** ✅`); }
+      catch (err) { log.push(`server name ❌ ${err.message}`); }
+    }
+  }
 
   for (const e of await fetchAll(guild, AuditLogEvent.RoleDelete, since)) {
     const o = oldValues(e);
@@ -84,19 +103,45 @@ async function restore(guild, since, preview) {
   return log.length ? log : ['nothing to restore in that window'];
 }
 
+// Deletes channels/roles whose audit-log creator is `userId`. Counts only unless `confirm`.
+async function cleanupBy(guild, userId, since, confirm) {
+  await guild.roles.fetch();
+  await guild.channels.fetch();
+  const fails = [];
+  let n = 0;
+  const targets = [
+    ...(await fetchAll(guild, AuditLogEvent.ChannelCreate, since)).map(e => [e, guild.channels.cache]),
+    ...(await fetchAll(guild, AuditLogEvent.RoleCreate, since)).map(e => [e, guild.roles.cache]),
+  ];
+  for (const [e, cache] of targets) {
+    const t = cache.get(e.targetId);
+    if (e.executorId !== userId || !t) continue;
+    n++;
+    if (!confirm) continue;
+    try { await t.delete('raid cleanup'); } catch (err) { fails.push(`${t.name} ❌ ${err.message}`); }
+  }
+  return [`${confirm ? 'deleted' : 'would delete'} ${n - fails.length} channels/roles`, ...fails];
+}
+
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-const register = g => g.commands.set([command.toJSON()]).catch(console.error);
+const register = g => g.commands.set([command.toJSON(), cleanupCmd.toJSON()]).catch(console.error);
 
 client.once(Events.ClientReady, c => { console.log(`up as ${c.user.tag}`); c.guilds.cache.forEach(register); });
 client.on(Events.GuildCreate, register);
 
 client.on(Events.InteractionCreate, async i => {
-  if (!i.isChatInputCommand() || i.commandName !== 'restore' || !i.guild) return;
+  if (!i.isChatInputCommand() || !['restore', 'cleanup'].includes(i.commandName) || !i.guild) return;
   if (!i.memberPermissions.has(PermissionFlagsBits.Administrator)) return i.reply({ content: 'Admins only.', ephemeral: true });
+  const user = i.options.getUser('user');
+  if (user && (user.id === client.user.id || user.id === i.guild.ownerId)) {
+    return i.reply({ content: "Can't target the bot or the server owner.", ephemeral: true });
+  }
   await i.deferReply({ ephemeral: true });
   const since = Date.now() - (i.options.getInteger('hours') ?? 24) * 3600e3;
   try {
-    const log = await restore(i.guild, since, i.options.getBoolean('preview') ?? false);
+    const log = i.commandName === 'cleanup'
+      ? await cleanupBy(i.guild, user.id, since, i.options.getBoolean('confirm') ?? false)
+      : await restore(i.guild, since, i.options.getBoolean('preview') ?? false);
     await i.editReply(log.join('\n').slice(0, 1900));
   } catch (err) { await i.editReply(`failed: ${err.message}`); }
 });
