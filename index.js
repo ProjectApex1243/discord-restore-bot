@@ -13,9 +13,10 @@ const command = new SlashCommandBuilder()
 
 const cleanupCmd = new SlashCommandBuilder()
   .setName('cleanup')
-  .setDescription('Delete channels and roles a raider created')
+  .setDescription('Delete what a raider created and/or channels with certain words in the name')
   .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-  .addUserOption(o => o.setName('user').setDescription('The raider (user or bot)').setRequired(true))
+  .addUserOption(o => o.setName('user').setDescription('The raider (user or bot)'))
+  .addStringOption(o => o.setName('names').setDescription('Delete channels whose name has any of these words, comma separated'))
   .addIntegerOption(o => o.setName('hours').setDescription('How far back to look (default 24)').setMinValue(1).setMaxValue(1080))
   .addBooleanOption(o => o.setName('confirm').setDescription('Actually delete. Without this it only counts'));
 
@@ -104,23 +105,37 @@ async function restore(guild, since, preview) {
 }
 
 // Deletes channels/roles whose audit-log creator is `userId`. Counts only unless `confirm`.
-async function cleanupBy(guild, userId, since, confirm) {
+// Raiders often use fancy-font names; fold small caps / math fonts to plain a-z so keywords match.
+const SMALL_CAPS = Object.fromEntries([...'ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘꞯʀꜱᴛᴜᴠᴡxʏᴢ'].map((c, i) => [c, 'abcdefghijklmnopqrstuvwxyz'[i]]));
+const plain = s => [...s.normalize('NFKD').toLowerCase()].map(c => SMALL_CAPS[c] ?? c).join('');
+
+async function cleanupBy(guild, userId, names, since, confirm) {
   await guild.roles.fetch();
   await guild.channels.fetch();
+  const victims = new Map(); // id -> channel/role
+  if (userId) {
+    const created = [
+      ...(await fetchAll(guild, AuditLogEvent.ChannelCreate, since)).map(e => [e, guild.channels.cache]),
+      ...(await fetchAll(guild, AuditLogEvent.RoleCreate, since)).map(e => [e, guild.roles.cache]),
+    ];
+    for (const [e, cache] of created) {
+      const t = cache.get(e.targetId);
+      if (e.executorId === userId && t) victims.set(t.id, t);
+    }
+  }
+  const words = (names ?? '').split(',').map(w => plain(w.trim())).filter(Boolean);
+  if (words.length) {
+    for (const c of guild.channels.cache.values()) if (words.some(w => plain(c.name).includes(w))) victims.set(c.id, c);
+  }
+  if (!confirm) {
+    const sample = [...victims.values()].slice(0, 15).map(t => t.name).join(', ');
+    return [`would delete ${victims.size} channels/roles`, sample];
+  }
   const fails = [];
-  let n = 0;
-  const targets = [
-    ...(await fetchAll(guild, AuditLogEvent.ChannelCreate, since)).map(e => [e, guild.channels.cache]),
-    ...(await fetchAll(guild, AuditLogEvent.RoleCreate, since)).map(e => [e, guild.roles.cache]),
-  ];
-  for (const [e, cache] of targets) {
-    const t = cache.get(e.targetId);
-    if (e.executorId !== userId || !t) continue;
-    n++;
-    if (!confirm) continue;
+  for (const t of victims.values()) {
     try { await t.delete('raid cleanup'); } catch (err) { fails.push(`${t.name} ❌ ${err.message}`); }
   }
-  return [`${confirm ? 'deleted' : 'would delete'} ${n - fails.length} channels/roles`, ...fails];
+  return [`deleted ${victims.size - fails.length} channels/roles`, ...fails];
 }
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -136,11 +151,15 @@ client.on(Events.InteractionCreate, async i => {
   if (user && (user.id === client.user.id || user.id === i.guild.ownerId)) {
     return i.reply({ content: "Can't target the bot or the server owner.", ephemeral: true });
   }
+  const names = i.options.getString('names');
+  if (i.commandName === 'cleanup' && !user && !names) {
+    return i.reply({ content: 'Give a `user` and/or `names`.', ephemeral: true });
+  }
   await i.deferReply({ ephemeral: true });
   const since = Date.now() - (i.options.getInteger('hours') ?? 24) * 3600e3;
   try {
     const log = i.commandName === 'cleanup'
-      ? await cleanupBy(i.guild, user.id, since, i.options.getBoolean('confirm') ?? false)
+      ? await cleanupBy(i.guild, user?.id, names, since, i.options.getBoolean('confirm') ?? false)
       : await restore(i.guild, since, i.options.getBoolean('preview') ?? false);
     await i.editReply(log.join('\n').slice(0, 1900));
   } catch (err) { await i.editReply(`failed: ${err.message}`); }
